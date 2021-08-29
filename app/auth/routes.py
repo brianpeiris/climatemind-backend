@@ -1,7 +1,10 @@
+import os
+from datetime import datetime, timezone
 from flask import request, jsonify, make_response
 from sqlalchemy import desc
 from app.auth import bp
 import regex as re
+import requests
 from flask_jwt_extended import create_access_token
 from flask_jwt_extended import current_user
 from flask_jwt_extended import jwt_required
@@ -13,12 +16,12 @@ from app.subscribe.store_subscription_data import check_email
 
 from app.errors.errors import InvalidUsageError, DatabaseError, UnauthorizedError
 
-
 from app.models import Users, Scores
 
 from app import db, auto
+from app import limiter
 
-import uuid
+import uuid, os
 
 """
 A series of endpoints for authentication.
@@ -27,62 +30,74 @@ Valid URLS to access the refresh endpoint are specified in app/__init__.py
 """
 
 
+@limiter.request_filter
+def ip_whitelist():
+    local = None
+
+    if (
+        os.environ["DATABASE_PARAMS"]
+        == "Driver={ODBC Driver 17 for SQL Server};Server=tcp:db,1433;Database=sqldb-web-prod-001;Uid=sa;Pwd=Cl1mat3m1nd!;Encrypt=no;TrustServerCertificate=no;Connection Timeout=30;"
+    ):
+        local = request.remote_addr == "127.0.0.1" or os.environ.get("VPN")
+
+    return local
+
+
 @bp.route("/login", methods=["POST"])
-@cross_origin()
 @auto.doc()
+@limiter.limit("100/day;50/hour;10/minute;5/second")
 def login():
     """
     Logs a user in by parsing a POST request containing user credentials.
     User provides email/password.
 
-    Returns: errors if data is not valid.
+    Returns: errors if data is not valid or captcha fails.
     Returns: Access token and refresh token otherwise.
     """
     r = request.get_json(force=True, silent=True)
 
     if not r:
         raise InvalidUsageError(
-            message="Email and password must included in the request body"
+            message="Email and password must be included in the request body."
         )
 
     email = r.get("email", None)
     password = r.get("password", None)
+    recaptcha_token = r.get("recaptchaToken", None)
 
     if check_email(email):
-        user = db.session.query(Users).filter_by(email=email).one_or_none()
+        user = db.session.query(Users).filter_by(user_email=email).one_or_none()
     else:
         raise UnauthorizedError(message="Wrong email or password. Try again.")
 
     if not user or not password_valid(password) or not user.check_password(password):
         raise UnauthorizedError(message="Wrong email or password. Try again.")
 
-    try:
-        scores = (
-            db.session.query(Scores)
-            .filter_by(user_uuid=user.uuid)
-            .order_by(desc("scores_created_timestamp"))
-            .first()
-        )
-    except:
-        raise DatabaseError(message="Failed to query scores from the database.")
+    # Verify captcha with Google
+    secret_key = os.environ.get("RECAPTCHA_SECRET_KEY")
+    data = {"secret": secret_key, "response": recaptcha_token}
+    resp = requests.post(
+        "https://www.google.com/recaptcha/api/siteverify", data=data
+    ).json()
 
-    if scores:
-        session_id = scores.session_uuid
-    else:
-        session_id = None
+    # Google will return True/False in the success field, resp must be json to properly access
+    if not resp["success"]:
+        raise UnauthorizedError(message="Captcha did not succeed.")
 
     access_token = create_access_token(identity=user, fresh=True)
     refresh_token = create_refresh_token(identity=user)
+
     response = make_response(
         jsonify(
             {
                 "message": "successfully logged in user",
                 "access_token": access_token,
                 "user": {
-                    "full_name": user.full_name,
-                    "email": user.email,
-                    "user_uuid": user.uuid,
-                    "session_id": session_id,
+                    "first_name": user.first_name,
+                    "last_name": user.last_name,
+                    "email": user.user_email,
+                    "user_uuid": user.user_uuid,
+                    "quiz_id": user.quiz_uuid,
                 },
             }
         ),
@@ -94,6 +109,7 @@ def login():
 
 @bp.route("/refresh", methods=["POST"])
 @jwt_required(refresh=True)
+@limiter.exempt
 def refresh():
     """
     Creates a refresh token and returns a new access token and refresh token to the user.
@@ -101,16 +117,31 @@ def refresh():
     These URLs are specified in app/__init__.py
     """
     identity = get_jwt_identity()
-    user = db.session.query(Users).filter_by(uuid=identity).one_or_none()
+    user = db.session.query(Users).filter_by(user_uuid=identity).one_or_none()
     access_token = create_access_token(identity=user)
     refresh_token = create_refresh_token(identity=user)
-    response = make_response(jsonify(access_token=access_token))
+
+    response = make_response(
+        jsonify(
+            {
+                "message": "successfully refreshed token",
+                "access_token": access_token,
+                "user": {
+                    "first_name": user.first_name,
+                    "last_name": user.last_name,
+                    "email": user.user_email,
+                    "user_uuid": user.user_uuid,
+                    "quiz_id": user.quiz_uuid,
+                },
+            }
+        ),
+        200,
+    )
     response.set_cookie("refresh_token", refresh_token, path="/refresh", httponly=True)
     return response
 
 
 @bp.route("/logout", methods=["POST"])
-@cross_origin()
 def logout():
     """
     Logs the user out by unsetting the refresh token cook
@@ -120,67 +151,70 @@ def logout():
     return response, 200
 
 
-@bp.route("/protected", methods=["GET"])
-@cross_origin()
-@jwt_required()
-def protected():
-    """
-    A temporary test endpoint for accessing a protected resource
-    """
-    return jsonify(
-        full_name=current_user.full_name,
-        uuid=current_user.uuid,
-        email=current_user.email,
-    )
-
-
 @bp.route("/register", methods=["POST"])
-@cross_origin()
+@limiter.limit("100/day;50/hour;10/minute;5/second")
 def register():
     """
     Registration endpoint
 
-    Takes a full_name, email, and password, validates this data and saves the user into the database.
+    Takes a first name, last name, email, and password, validates this data and saves the user into the database.
     The user should automatically be logged in upon successful registration.
     The same email cannot be used for more than one account.
-    Users will have to take the quiz before registering, meaning the session-id is linked to scores.
+    Users will have to take the quiz before registering, meaning the quiz_uuid is linked to scores.
 
     Returns: Errors if any data is invalid
     Returns: Access Token and Refresh Token otherwise
     """
+
     r = request.get_json(force=True, silent=True)
 
     if not r:
         raise InvalidUsageError(
-            message="Email and password must included in the request body"
+            message="Email and password must be included in the request body."
         )
 
-    full_name = r.get("fullname", None)
+    first_name = r.get("firstName", None)
+    last_name = r.get("lastName", None)
     email = r.get("email", None)
     password = r.get("password", None)
-    session_id = r.get("sessionId", None)
+    quiz_uuid = r.get("quizId", None)
 
-    if not valid_name(full_name):
+    if not valid_name(first_name):
         raise InvalidUsageError(
-            message="Full name must be between 2 and 50 characters."
+            message="First name must be between 2 and 50 characters."
         )
 
-    if not valid_session_id(session_id):
-        raise InvalidUsageError(message="Session ID is not a valid UUID4 format.")
+    if not valid_name(last_name):
+        raise InvalidUsageError(
+            message="Last name must be between 2 and 50 characters."
+        )
 
-    scores = get_scores(session_id)
+    if not quiz_uuid:
+        raise InvalidUsageError(message="Quiz UUID must be included to register.")
 
-    if check_email(email) and password_valid(password):
-        user = Users.find_by_username(email)
-    else:
-        raise InvalidUsageError(message="Wrong email or password. Try again.")
+    try:
+        quiz_uuid = uuid.UUID(quiz_uuid)
 
+    except:
+        raise InvalidUsageError(message="Quiz UUID is improperly formatted.")
+
+    if not scores_in_db(quiz_uuid):
+        raise DatabaseError(message="Quiz ID is not in the db.")
+
+    if not check_email(email):
+        raise InvalidUsageError(message=f"The email {email} is invalid.")
+
+    if not password_valid(password):
+        raise InvalidUsageError(
+            message="Password does not fit the requirements. "
+            "Password must be between 8-128 characters, contain at least one number or special character, and cannot contain any spaces."
+        )
+
+    user = Users.find_by_username(email)
     if user:
         raise UnauthorizedError(message="Email already registered")
     else:
-        user = add_user_to_db(full_name, email, password)
-
-    link_user_to_scores(scores, user.uuid)
+        user = add_user_to_db(first_name, last_name, email, password, quiz_uuid)
 
     access_token = create_access_token(identity=user, fresh=True)
     refresh_token = create_refresh_token(identity=user)
@@ -190,10 +224,11 @@ def register():
                 "message": "Successfully created user",
                 "access_token": access_token,
                 "user": {
-                    "full_name": user.full_name,
-                    "email": user.email,
-                    "user_uuid": user.uuid,
-                    "session_id": scores.session_uuid,
+                    "first_name": user.first_name,
+                    "last_name": user.last_name,
+                    "email": user.user_email,
+                    "user_uuid": user.user_uuid,
+                    "quiz_id": user.quiz_uuid,
                 },
             }
         ),
@@ -203,19 +238,29 @@ def register():
     return response
 
 
-def add_user_to_db(full_name, email, password):
+def add_user_to_db(first_name, last_name, email, password, quiz_uuid):
     """
     Adds user to database or throws an error if unable to do so.
 
     Parameters:
-        full_name (str)
+        first_name (str)
+        last_name (str)
         email (str)
         password (str)
+        quiz_uuid (uuid)
 
     Returns: the user object
     """
-    session_uuid = uuid.uuid4()
-    user = Users(full_name=full_name, email=email, uuid=session_uuid)
+    user_uuid = uuid.uuid4()
+    user_created_timestamp = datetime.now(timezone.utc)
+    user = Users(
+        user_uuid=user_uuid,
+        first_name=first_name,
+        last_name=last_name,
+        user_email=email,
+        quiz_uuid=quiz_uuid,
+        user_created_timestamp=user_created_timestamp,
+    )
     user.set_password(password)
 
     try:
@@ -228,98 +273,40 @@ def add_user_to_db(full_name, email, password):
     return user
 
 
-def link_user_to_scores(scores, user_uuid):
-    """
-    If a user has already taken the survey, they will have a session-id and
-    a set of scores which should be linked to their new account.
-
-    Parameters:
-        scores (database object)
-        user_uuid (uuid4 as str)
-    """
-    try:
-        scores.user_uuid = user_uuid
-        db.session.commit()
-    except:
-        raise DatabaseError(
-            message="An error occurred while querying the scores from the database."
-        )
-
-
-def valid_name(full_name):
+def valid_name(name):
     """
     Names must be between 2 and 50 characters.
     """
-    if not full_name:
-        raise InvalidUsageError(message="Full name is missing")
-    return 2 <= len(full_name) <= 50
+    if not name:
+        raise InvalidUsageError(message="Name is missing.")
+    return 2 <= len(name) <= 50
 
 
 def password_valid(password):
     """
-    Passwords must contain uppercase and lowercase letters, and digits.
-    Passwords must be between 8 and 20 characters.
+    Passwords must contain at least one digit or special character.
+    Passwords must be between 8 and 128 characters.
+    Passwords cannot contain spaces.
     """
     if not password:
         raise InvalidUsageError(
-            message="Email and password must included in the request body"
+            message="Email and password must be included in the request body."
         )
 
     conds = [
-        lambda s: any(x.isupper() for x in s),
-        lambda s: any(x.islower() for x in s),
-        lambda s: any(x.isdigit() for x in s),
-        lambda s: 8 <= len(s) <= 20,
+        lambda s: any(x.isdigit() or not x.isalnum() for x in s),
+        lambda s: all(not x.isspace() for x in s),
+        lambda s: 8 <= len(s) <= 128,
     ]
     return all(cond(password) for cond in conds)
 
 
-def valid_session_id(session_id):
+def scores_in_db(quiz_uuid):
     """
-    Checks for valid UUID4 format
-    xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
-
-    Parameters: session_id (str)
-
-    Returns: True if valid
+    Check that the quizId received from the frontend is in the scores table in the db.
     """
-    regex = re.compile(
-        "^[a-f0-9]{8}-?[a-f0-9]{4}-?4[a-f0-9]{3}-?[89ab][a-f0-9]{3}-?[a-f0-9]{12}\Z",
-        re.I,
-    )
-    match = regex.match(session_id)
-    return bool(match)
-
-
-def get_scores(session_id):
-    """
-    Validates that a session exists within the DB by checking the scores
-    table for the most recent scores associated with the provided session id.
-
-    Users may have multiple session IDs if they retake the quiz, so we need to
-    return the most recently created version.
-
-    Parameters:
-        session_id (uuid4 as str)
-
-    Returns: Scores entry if exists
-    Otherwise throws error
-    """
-    try:
-        scores = (
-            db.session.query(Scores)
-            .filter_by(session_uuid=session_id)
-            .order_by(desc("scores_created_timestamp"))
-            .first()
-        )
-    except:
-        raise DatabaseError(
-            message="An error occurred while querying the scores from the database."
-        )
-
-    if not scores:
-        raise InvalidUsageError(
-            "Provided session ID is not associated with any quiz scores."
-        )
-
-    return scores
+    scores = db.session.query(Scores).filter_by(quiz_uuid=quiz_uuid).first()
+    if scores:
+        return True
+    else:
+        return False
