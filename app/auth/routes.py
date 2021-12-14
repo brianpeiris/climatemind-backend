@@ -210,7 +210,7 @@ def register():
             "Password must be between 8-128 characters, contain at least one number or special character, and cannot contain any spaces."
         )
 
-    user = Users.find_by_username(email)
+    user = Users.find_by_email(email)
     if user:
         raise UnauthorizedError(message="Email already registered")
     else:
