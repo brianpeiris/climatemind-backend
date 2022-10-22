@@ -198,3 +198,15 @@ def test_conversation_request_unauthorized(client_with_user_and_header, accept_j
         )
 
         assert response.status_code == 401, "Unauthorized access forbidden"
+
+
+@pytest.mark.integration
+def test_get_conversations_empty(client_with_user_and_header, accept_json):
+    client, user, session_header, _ = client_with_user_and_header
+    url = url_for("conversations.get_conversations")
+    response = client.get(
+        url,
+        headers=session_header + accept_json,
+    )
+    assert response.status_code == 200, str(response.json)
+    assert response.json == {"conversations":[]}
